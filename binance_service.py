@@ -8,10 +8,22 @@ Handles:
 - Account balance retrieval (free, locked, total USDT & crypto balances)
 - Exchange trading rules, filters, step sizes, and price/qty precision formatting
 - Strict safety controls: Live trading remains disabled by default.
-- DRY_RUN execution mode (Phase 3.2b): When enabled (the default), the order
-  execution layer simulates/logs intended orders instead of contacting the
-  Binance order-placement endpoint. This is a safety layer in addition to,
-  not a replacement for, the LIVE_TRADING_ENABLED shield below.
+ - DRY_RUN execution mode (Phase 3.2b): When enabled (the default), the order
+   execution layer simulates/logs intended orders instead of contacting the
+   Binance order-placement endpoint. This is a safety layer in addition to,
+   not a replacement for, the LIVE_TRADING_ENABLED shield below.
+ - Order execution engine (Phase 3.2c): place_order() submits exchange orders
+  to the signed /api/v3/order endpoint only when explicitly enabled, retrieves
+  and confirms order status via get_order_status(), and supports cancellation
+  via cancel_order(). Raw Binance order statuses are normalized to filled,
+  partially_filled, pending, cancelled, or rejected labels.
+ - Strategy-flow integration (Phase 3.3): main.py routes paper BUY/SELL entries
+   and exits through place_order(), so every intended order flows through this
+   engine while DRY_RUN remains enabled by default.
+ - API-permission verification (Phase 3.1): assert_api_permissions() verifies
+   the configured key may trade and that the read-only mandate holds, using
+   get_account_info() (canTrade / withdrawal-disabled) - a read-only check
+   that never places orders or alters the safety guards.
 """
 
 import os
@@ -19,12 +31,53 @@ import time
 import hmac
 import hashlib
 import math
+import re
 from typing import Dict, Any, Optional, List, Tuple
 from urllib.parse import urlencode
 import requests
 from dotenv import load_dotenv
+import pandas as pd
 
 load_dotenv()
+
+
+# ============================================================================
+# ORDER STATUS NORMALIZATION (Phase 3.2c)
+# Maps raw Binance order status strings to stable, human-readable labels so the
+# execution engine can distinguish filled, partially filled, pending, cancelled
+# and rejected orders regardless of API-version wording.
+# ============================================================================
+ORDER_STATUS_LABELS = {
+    "NEW": "pending",
+    "PENDING_NEW": "pending",
+    "PARTIALLY_FILLED": "partially_filled",
+    "FILLED": "filled",
+    "CANCELED": "cancelled",
+    "PENDING_CANCEL": "cancelled",
+    "EXPIRED": "cancelled",
+        "REJECTED": "rejected",
+}
+
+
+# ============================================================================
+# Phase 4 - Market-data helpers (klines/candles) for BTC & ETH (+ others).
+# Whitelists and interval metadata consumed by BinanceService.get_klines().
+# ============================================================================
+SUPPORTED_KLINE_INTERVALS = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
+_INTERVAL_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400,
+}
+# A candle whose open_time is older than 2x its interval is treated as stale:
+# generous enough to absorb clock skew, small enough to flag a paused/halted pair.
+_STALE_FACTOR = 2.0
+
+_KLINE_COLUMNS = [
+    "open_time", "open", "high", "low", "close", "volume",
+    "close_time", "quote_asset_volume", "trades",
+    "taker_buy_base", "taker_buy_quote", "ignore",
+]
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,10}$")
 
 
 class BinanceService:
@@ -155,6 +208,61 @@ class BinanceService:
             return {"success": False, "error": f"Binance API Error ({res.status_code}): {msg}", "data": None}
         except requests.RequestException as e:
             return {"success": False, "error": f"Network Error: {str(e)}", "data": None}
+
+    def assert_api_permissions(self) -> Dict[str, Any]:
+        """
+        Verify the Binance API key permissions required for trading (Phase 3.1,
+        Requirement 5).
+
+        Uses get_account_info() to confirm the account can trade and that the
+        read-only mandate is respected (withdrawal/transfer remains disabled).
+        This is a strictly read-only check - it never places an order and never
+        changes LIVE_TRADING_ENABLED or DRY_RUN.
+
+        Returns a structured result:
+            on success: {"success": True, "error": None, ...permissions}
+            on failure: {"success": False, "error": <msg>, ...permissions}
+        """
+        account_res = self.get_account_info()
+        if not account_res["success"]:
+            return {
+                "success": False,
+                "error": account_res.get("error"),
+                "can_trade": None,
+                "withdraw_allowed": None,
+                "account_type": None,
+            }
+
+        data = account_res["data"]
+        can_trade = bool(data.get("canTrade", False))
+        withdraw_allowed = bool(data.get("withdrawAllEnabled", False))
+        account_type = data.get("accountType", "SPOT")
+
+        if not can_trade:
+            return {
+                "success": False,
+                "error": "Binance API key is not permitted to trade (canTrade is False).",
+                "can_trade": can_trade,
+                "withdraw_allowed": withdraw_allowed,
+                "account_type": account_type,
+            }
+
+        if withdraw_allowed:
+            return {
+                "success": False,
+                "error": "Binance API key has withdrawal enabled; violates the read-only mandate.",
+                "can_trade": can_trade,
+                "withdraw_allowed": withdraw_allowed,
+                "account_type": account_type,
+            }
+
+        return {
+            "success": True,
+            "error": None,
+            "can_trade": can_trade,
+            "withdraw_allowed": withdraw_allowed,
+            "account_type": account_type,
+        }
 
     def get_account_balances(self, tracked_assets: Optional[List[str]] = None) -> Dict[str, Any]:
         """
@@ -364,6 +472,220 @@ class BinanceService:
         except Exception as e:
             return False, 0.0, f"Failed to fetch price for {symbol_pair}: {str(e)}"
 
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str = "15m",
+        limit: int = 100,
+    ) -> Tuple[bool, Optional["pd.DataFrame"], Optional[str]]:
+        """
+        Fetch OHLCV candlesticks (klines) from /api/v3/klines (Phase 4).
+
+        Safe retrieval for BTC & ETH (and any other quoted symbol):
+          * ``interval`` is validated against ``SUPPORTED_KLINE_INTERVALS``;
+          * ``symbol`` is normalized to ``<SYMBOL>USDT`` and format-validated;
+          * empty / non-list / HTTP-failure responses return a clean
+            ``(False, None, error)`` tuple instead of crashing callers;
+          * the newest candle's ``open_time`` is recency-checked so a paused or
+            halted pair is surfaced as stale data rather than being trusted.
+
+        Returns
+        -------
+        Tuple[bool, Optional[pandas.DataFrame], Optional[str]]
+            ``(success, dataframe_or_None, error_message)``
+        """
+        # --- input validation (no network) -----------------------------------
+        if interval not in SUPPORTED_KLINE_INTERVALS:
+            return (
+                False,
+                None,
+                f"Unsupported interval '{interval}'. "
+                f"Allowed: {', '.join(SUPPORTED_KLINE_INTERVALS)}.",
+            )
+
+        raw = (symbol or "").upper()
+        base = raw[:-4] if raw.endswith("USDT") else raw
+        symbol_pair = f"{base}USDT"
+        if not base or not _SYMBOL_RE.match(base):
+            return False, None, f"Invalid symbol '{symbol}'. Expected e.g. 'BTC' or 'BTCUSDT'."
+
+        # --- fetch -----------------------------------------------------------
+        url = f"{self.base_url}/api/v3/klines"
+        params = {"symbol": symbol_pair, "interval": interval, "limit": limit}
+        try:
+            res = self.session.get(
+                url, headers=self._get_headers(), params=params, timeout=self.timeout
+            )
+            res.raise_for_status()
+            data = res.json()
+        except Exception as e:
+            return False, None, f"Failed to fetch klines for {symbol_pair}: {str(e)}"
+
+        # --- empty / malformed response -------------------------------------
+        if not isinstance(data, list) or not data:
+            return False, None, f"No klines data returned for {symbol_pair}."
+
+        # --- build DataFrame -------------------------------------------------
+        try:
+            df = pd.DataFrame(data, columns=_KLINE_COLUMNS)
+            df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+            df["close_time"] = pd.to_numeric(df["close_time"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["high"] = pd.to_numeric(df["high"], errors="coerce")
+            df["low"] = pd.to_numeric(df["low"], errors="coerce")
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        except Exception as e:
+            return False, None, f"Failed to parse klines for {symbol_pair}: {str(e)}"
+
+        # --- staleness check on the newest candle ---------------------------
+        try:
+            newest_open_time = int(df["open_time"].iloc[-1])
+            age_ms = int(time.time() * 1000) - newest_open_time
+            threshold_ms = _STALE_FACTOR * _INTERVAL_SECONDS[interval] * 1000
+            if age_ms > threshold_ms:
+                return (
+                    False,
+                    df,
+                    f"Stale data for {symbol_pair}: newest candle is "
+                    f"{age_ms / 1000.0:.0f}s old (>{_STALE_FACTOR:g}x interval).",
+                )
+        except Exception:
+            return False, df, f"Could not evaluate candle recency for {symbol_pair}."
+
+        return True, df, None
+
+    def classify_order_status(self, raw_status: Optional[str]) -> str:
+        """
+        Map a raw Binance order status string to a normalized, human-readable label.
+
+        Phase 3.2c execution engine. Distinguishes order states where supported
+        by the Binance API:
+          - pending:           NEW, PENDING_NEW
+          - filled:            FILLED
+          - partially_filled:  PARTIALLY_FILLED
+          - cancelled:         CANCELED, PENDING_CANCEL, EXPIRED
+          - rejected:          REJECTED
+          - unknown:           anything else / missing
+        """
+        if not raw_status:
+            return "unknown"
+        return ORDER_STATUS_LABELS.get(str(raw_status).strip().upper(), "unknown")
+
+    def _signed_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Send an authenticated request to a Binance private endpoint (Phase 3.2c).
+
+        Automatically stamps timestamp + recvWindow, signs the query string with
+        the configured API secret, and sets the X-MBX-APIKEY header. Returns a
+        structured, normalized result:
+            {"success": True, "data": <parsed json>, "http_status": 200}
+            {"success": False, "error": <message>, "code": <int|None>,
+             "http_status": <int|None>}
+        """
+        if not self.is_configured:
+            return {
+                "success": False,
+                "error": "Binance API Key and Secret are not configured in environment variables.",
+                "code": None,
+                "http_status": None,
+            }
+
+        body = dict(params or {})
+        body["timestamp"] = int(time.time() * 1000)
+        body["recvWindow"] = 5000
+        body["signature"] = self._generate_signature(urlencode(body))
+
+        url = f"{self.base_url}{path}"
+        method_upper = method.upper()
+        try:
+            if method_upper == "POST":
+                res = self.session.post(url, headers=self._get_headers(), data=body, timeout=self.timeout)
+            elif method_upper == "DELETE":
+                res = self.session.delete(url, headers=self._get_headers(), params=body, timeout=self.timeout)
+            else:
+                res = self.session.get(url, headers=self._get_headers(), params=body, timeout=self.timeout)
+        except requests.RequestException as e:
+            return {
+                "success": False,
+                "error": f"Network Error: {str(e)}",
+                "code": None,
+                "http_status": None,
+            }
+
+        try:
+            data = res.json()
+        except Exception:
+            data = {}
+
+        if res.status_code == 200:
+            return {"success": True, "data": data, "http_status": res.status_code}
+
+        return {
+            "success": False,
+            "error": f"Binance API Error ({res.status_code}): {data.get('msg', res.text)}",
+            "code": data.get("code"),
+            "http_status": res.status_code,
+        }
+
+    def _execution_report(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Optional[float],
+        order_type: str,
+        price: Optional[float] = None,
+        order_id: Optional[str] = None,
+        status: Optional[str] = None,
+        executed_quantity: float = 0.0,
+        execution_price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        success: bool = True,
+        raw_order: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a single consistent execution result dict and log it clearly.
+
+        Logs symbol, side, quantity, order ID, order type, price, status and the
+        execution (average fill) price for every real order (Phase 3.2c engine).
+        """
+        report = {
+            "success": success,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "order_id": order_id,
+            "order_type": order_type,
+            "status": status,
+            "status_label": self.classify_order_status(status),
+            "executed_quantity": executed_quantity,
+            "execution_price": execution_price,
+            "client_order_id": client_order_id,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "dry_run": False,
+            "error": error,
+            "raw_order": raw_order,
+        }
+        error_suffix = f" | Error: {error}" if error else ""
+        print(
+            f"[ORDER EXECUTION] Symbol: {symbol} | Side: {side} | Quantity: {quantity} | "
+            f"Type: {order_type} | Order ID: {order_id} | Price: {price} | "
+            f"Status: {status} (normalized: {report['status_label']}) | "
+            f"Executed Qty: {executed_quantity} | "
+            f"Execution Price: {execution_price if execution_price is not None else 'N/A'}"
+            f"{error_suffix}"
+        )
+        return report
+
     def place_order(
         self,
         symbol: Optional[str] = None,
@@ -372,40 +694,65 @@ class BinanceService:
         price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        order_type: str = "MARKET",
+        time_in_force: str = "GTC",
         *args,
         **kwargs,
     ) -> Dict[str, Any]:
         """
-        Execution-layer entry point for order placement.
+        Execution-layer entry point for order placement (Phase 3.2c execution engine).
+
+        Supports the existing BUY and SELL execution flow:
+          - side: "BUY" or "SELL"
+          - order_type: "MARKET" (default) or "LIMIT"
+          - For LIMIT orders, `price` and `time_in_force` (GTC/IOC/FOK) are sent.
 
         DRY_RUN MODE (Phase 3.2b) — checked FIRST, on by default:
         While self.dry_run is True, this method NEVER contacts Binance to place a
         real order. It only simulates and logs the intended order (symbol, side,
         quantity, entry/current price, stop loss, take profit) and returns a
-        structured simulation result. This check happens before, and independently
-        of, the live-trading safety shield below, so DRY_RUN alone is sufficient to
-        guarantee no real order is ever sent.
+        structured simulation result that includes a simulated order ID. This
+        check happens before, and independently of, the live-trading safety shield
+        below, so DRY_RUN alone is sufficient to guarantee no real order is ever
+        sent.
 
         SAFETY SHIELD (unchanged from Phase 3.2): Live order placement remains
         strictly blocked whenever live_trading_enabled is False. This guard is
         permanent until a future phase explicitly enables live trading via a
         confirmed, reviewed configuration change. Paper trading remains the only
         permitted execution mode alongside DRY_RUN simulation.
+
+        When both guards pass, the order is submitted to the signed
+        POST /api/v3/order endpoint and a structured execution report (symbol,
+        side, quantity, order ID, order type, status, execution price) is
+        returned/logged. Order status can then be confirmed later with
+        get_order_status() or modified with cancel_order().
         """
         if self.dry_run:
             simulated_order = {
+                "success": True,
                 "status": "SIMULATED",
+                "status_label": "simulated",
                 "dry_run": True,
+                "order_id": f"SIM-{int(time.time() * 1000)}",
                 "symbol": symbol,
                 "side": side,
                 "quantity": quantity,
                 "price": price,
+                "order_type": order_type,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
+                "executed_quantity": 0.0,
+                "execution_price": price if price is not None else None,
+                "client_order_id": None,
+                "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "error": None,
+                "raw_order": None,
             }
             print(
                 "[DRY_RUN] Simulated order — NO real order sent to Binance | "
                 f"Symbol: {symbol} | Side: {side} | Quantity: {quantity} | "
+                f"Order ID: {simulated_order['order_id']} | Type: {order_type} | "
                 f"Entry/Current Price: {price} | Stop Loss: {stop_loss} | "
                 f"Take Profit: {take_profit}"
             )
@@ -416,7 +763,337 @@ class BinanceService:
                 "LIVE TRADING IS DISABLED. Real orders cannot be placed. "
                 "Allmightsee Prime is operating in paper-trading-only mode."
             )
-        raise NotImplementedError("Live order placement has not been implemented.")
+
+        # ====================================================================
+        # REAL ORDER SUBMISSION (Phase 3.2c execution engine)
+        # --------------------------------------------------------------------
+        # Only reachable when BOTH safety guards above have passed:
+        #   1) DRY_RUN is OFF  (explicit, reviewed configuration change)
+        #   2) live_trading_enabled is ON
+        # Binance trading-rule checks (format_quantity, format_price,
+        # validate_order) are enforced BEFORE any request reaches the API.
+        # ====================================================================
+        symbol_pair = f"{symbol.upper()}USDT" if not symbol.upper().endswith("USDT") else symbol.upper()
+        side_upper = (side or "").upper()
+        order_type_upper = (order_type or "MARKET").upper()
+
+        if side_upper not in ("BUY", "SELL"):
+            return self._execution_report(
+                symbol=symbol_pair,
+                side=side_upper,
+                quantity=quantity,
+                order_type=order_type_upper,
+                price=price,
+                status="REJECTED",
+                success=False,
+                error=f"Invalid side '{side}' — must be BUY or SELL.",
+            )
+
+        if not quantity or quantity <= 0:
+            return self._execution_report(
+                symbol=symbol_pair,
+                side=side_upper,
+                quantity=quantity,
+                order_type=order_type_upper,
+                price=price,
+                status="REJECTED",
+                success=False,
+                error="Quantity must be a positive number.",
+            )
+
+        # Apply Binance LOT_SIZE step-size rounding (risk control, unchanged).
+        qty_ok, formatted_qty, qty_err = self.format_quantity(symbol_pair, quantity)
+        if not qty_ok:
+            return self._execution_report(
+                symbol=symbol_pair,
+                side=side_upper,
+                quantity=quantity,
+                order_type=order_type_upper,
+                price=price,
+                status="REJECTED",
+                success=False,
+                error=qty_err,
+            )
+
+        params: Dict[str, Any] = {
+            "symbol": symbol_pair,
+            "side": side_upper,
+            "type": order_type_upper,
+            "quantity": formatted_qty,
+        }
+
+        reference_price = price
+        formatted_price = price
+
+        if order_type_upper == "LIMIT":
+            if not price or price <= 0:
+                return self._execution_report(
+                    symbol=symbol_pair,
+                    side=side_upper,
+                    quantity=formatted_qty,
+                    order_type=order_type_upper,
+                    price=price,
+                    status="REJECTED",
+                    success=False,
+                    error="A positive price is required for LIMIT orders.",
+                )
+            price_ok, formatted_price, price_err = self.format_price(symbol_pair, price)
+            if not price_ok:
+                return self._execution_report(
+                    symbol=symbol_pair,
+                    side=side_upper,
+                    quantity=formatted_qty,
+                    order_type=order_type_upper,
+                    price=price,
+                    status="REJECTED",
+                    success=False,
+                    error=price_err,
+                )
+            valid, validation_error = self.validate_order(symbol_pair, formatted_qty, formatted_price)
+            if not valid:
+                return self._execution_report(
+                    symbol=symbol_pair,
+                    side=side_upper,
+                    quantity=formatted_qty,
+                    order_type=order_type_upper,
+                    price=formatted_price,
+                    status="REJECTED",
+                    success=False,
+                    error=validation_error,
+                )
+            params["price"] = formatted_price
+            params["timeInForce"] = (time_in_force or "GTC").upper()
+
+        elif order_type_upper == "MARKET":
+            # Notional check uses the provided price or the live market price.
+            if not reference_price:
+                price_ok_live, reference_price, _ = self.get_current_price(symbol_pair)
+                if not price_ok_live:
+                    reference_price = None
+            if reference_price and reference_price > 0:
+                valid, validation_error = self.validate_order(symbol_pair, formatted_qty, reference_price)
+                if not valid:
+                    return self._execution_report(
+                        symbol=symbol_pair,
+                        side=side_upper,
+                        quantity=formatted_qty,
+                        order_type=order_type_upper,
+                        price=reference_price,
+                        status="REJECTED",
+                        success=False,
+                        error=validation_error,
+                    )
+
+        else:
+            return self._execution_report(
+                symbol=symbol_pair,
+                side=side_upper,
+                quantity=formatted_qty,
+                order_type=order_type_upper,
+                price=price,
+                status="REJECTED",
+                success=False,
+                error=f"Unsupported order type '{order_type}' — use MARKET or LIMIT.",
+            )
+
+        # Submit the order to the signed Binance endpoint and build the report.
+        submitted = self._signed_request("POST", "/api/v3/order", params)
+        if not submitted["success"]:
+            return self._execution_report(
+                symbol=symbol_pair,
+                side=side_upper,
+                quantity=formatted_qty,
+                order_type=order_type_upper,
+                price=price,
+                status="REJECTED",
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                success=False,
+                error=submitted["error"],
+            )
+
+        raw = submitted["data"]
+        raw_status = raw.get("status", "UNKNOWN")
+        executed_qty = float(raw.get("executedQty", 0.0) or 0.0)
+        quote_qty = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
+        execution_price = (quote_qty / executed_qty) if executed_qty else (price if price else reference_price)
+
+        return self._execution_report(
+            symbol=symbol_pair,
+            side=side_upper,
+            quantity=formatted_qty,
+            order_type=order_type_upper,
+            price=formatted_price if order_type_upper == "LIMIT" else (price if price else reference_price),
+            order_id=raw.get("orderId"),
+            status=raw_status,
+            executed_quantity=executed_qty,
+            execution_price=execution_price,
+            client_order_id=raw.get("clientOrderId"),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            raw_order=raw,
+        )
+
+
+    def get_order_status(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve and confirm the current status of an order (GET /api/v3/order).
+
+        Returns the raw Binance status plus a normalized label so callers can
+        distinguish filled, partially filled, pending, cancelled and rejected
+        orders (Phase 3.2c execution engine).
+
+        DRY_RUN is checked first — in simulation mode no request is ever sent
+        and a simulated confirmation (order status "SIMULATED") is returned.
+        """
+        symbol_pair = f"{symbol.upper()}USDT" if not symbol.upper().endswith("USDT") else symbol.upper()
+
+        if self.dry_run:
+            print(
+                "[DRY_RUN] Simulated order status confirmation — NO request sent to Binance | "
+                f"Symbol: {symbol_pair} | Order ID: {order_id}"
+            )
+            return {
+                "success": True,
+                "dry_run": True,
+                "symbol": symbol_pair,
+                "order_id": order_id,
+                "status": "SIMULATED",
+                "status_label": "simulated",
+                "executed_quantity": 0.0,
+                "execution_price": None,
+                "error": None,
+                "raw_order": None,
+            }
+
+        if not order_id:
+            return {
+                "success": False,
+                "dry_run": False,
+                "symbol": symbol_pair,
+                "order_id": None,
+                "status": None,
+                "status_label": self.classify_order_status(None),
+                "error": "order_id is required to query the order status.",
+                "raw_order": None,
+            }
+
+        res = self._signed_request("GET", "/api/v3/order", {"symbol": symbol_pair, "orderId": order_id})
+        if not res["success"]:
+            return {
+                "success": False,
+                "dry_run": False,
+                "symbol": symbol_pair,
+                "order_id": order_id,
+                "status": None,
+                "status_label": self.classify_order_status(None),
+                "error": res["error"],
+                "raw_order": None,
+            }
+
+        raw = res["data"]
+        raw_status = raw.get("status", "UNKNOWN")
+        executed_qty = float(raw.get("executedQty", 0.0) or 0.0)
+        quote_qty = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
+        execution_price = (quote_qty / executed_qty) if executed_qty else None
+
+        return {
+            "success": True,
+            "dry_run": False,
+            "symbol": raw.get("symbol", symbol_pair),
+            "side": raw.get("side"),
+            "quantity": float(raw.get("origQty", 0.0) or 0.0),
+            "price": float(raw.get("price", 0.0) or 0.0),
+            "order_id": raw.get("orderId", order_id),
+            "order_type": raw.get("type"),
+            "status": raw_status,
+            "status_label": self.classify_order_status(raw_status),
+            "executed_quantity": executed_qty,
+            "execution_price": execution_price,
+            "client_order_id": raw.get("clientOrderId"),
+            "error": None,
+            "raw_order": raw,
+        }
+
+
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Cancel an existing order (DELETE /api/v3/order) and return its final status.
+
+        A successfully cancelled order is normalized to the "cancelled" label.
+
+        DRY_RUN is checked first — in simulation mode no request is ever sent
+        and a simulated cancellation is returned instead.
+        """
+        symbol_pair = f"{symbol.upper()}USDT" if not symbol.upper().endswith("USDT") else symbol.upper()
+
+        if self.dry_run:
+            print(
+                "[DRY_RUN] Simulated cancel — NO real cancel sent to Binance | "
+                f"Symbol: {symbol_pair} | Order ID: {order_id}"
+            )
+            return {
+                "success": True,
+                "dry_run": True,
+                "symbol": symbol_pair,
+                "order_id": order_id,
+                "status": "CANCELED",
+                "status_label": self.classify_order_status("CANCELED"),
+                "executed_quantity": 0.0,
+                "error": None,
+                "raw_order": None,
+            }
+
+        if not order_id:
+            return {
+                "success": False,
+                "dry_run": False,
+                "symbol": symbol_pair,
+                "order_id": None,
+                "status": None,
+                "status_label": self.classify_order_status(None),
+                "error": "order_id is required to cancel an order.",
+                "raw_order": None,
+            }
+
+        res = self._signed_request("DELETE", "/api/v3/order", {"symbol": symbol_pair, "orderId": order_id})
+        if not res["success"]:
+            return {
+                "success": False,
+                "dry_run": False,
+                "symbol": symbol_pair,
+                "order_id": order_id,
+                "status": None,
+                "status_label": self.classify_order_status(None),
+                "error": res["error"],
+                "raw_order": None,
+            }
+
+        raw = res["data"]
+        raw_status = raw.get("status", "CANCELED")
+        return {
+            "success": True,
+            "dry_run": False,
+            "symbol": raw.get("symbol", symbol_pair),
+            "side": raw.get("side"),
+            "quantity": float(raw.get("origQty", 0.0) or 0.0),
+            "price": float(raw.get("price", 0.0) or 0.0),
+            "order_id": raw.get("orderId", order_id),
+            "order_type": raw.get("type"),
+            "status": raw_status,
+            "status_label": self.classify_order_status(raw_status),
+            "executed_quantity": float(raw.get("executedQty", 0.0) or 0.0),
+            "error": None,
+            "raw_order": raw,
+        }
 
 
 # Global default service instance

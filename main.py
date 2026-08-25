@@ -35,37 +35,20 @@ TOKEN = os.getenv("BOT_TOKEN")
 
 
 def get_klines(symbol, interval="15m", limit=100):
-    url = (
-        "https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}USDT&interval={interval}&limit={limit}"
-    )
+    """Fetch OHLCV klines for ``symbol`` (e.g. BTC, ETH) and attach indicators.
 
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    data = response.json()
+    Raw retrieval + validation is delegated to ``binance_service.get_klines()``
+    so that unsupported symbols/intervals, empty responses, HTTP failures and
+    stale candles are handled safely instead of crashing callers (Phase 4).
+    Any such failure raises ``requests.RequestException`` — every existing
+    caller already wraps this call in a try/except.
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_asset_volume",
-            "trades",
-            "taker_buy_base",
-            "taker_buy_quote",
-            "ignore",
-        ],
-    )
-
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["volume"] = df["volume"].astype(float)
+    The happy-path DataFrame shape and the computed indicator columns
+    (ema20, rsi, macd*, atr) are identical to the previous implementation.
+    """
+    ok, df, err = binance_service.get_klines(symbol, interval=interval, limit=limit)
+    if not ok or df is None:
+        raise requests.RequestException(err or f"Failed to fetch klines for {symbol}.")
 
     df["ema20"] = EMAIndicator(df["close"], window=20).ema_indicator()
     df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
@@ -239,12 +222,26 @@ def open_paper_trade(analysis):
     - Allocates PAPER_POSITION_SIZE_USD of simulated capital to each trade.
     - Quantity is rounded to Binance LOT_SIZE stepSize for realistic simulation.
       If symbol rules are unavailable, falls back to raw quantity.
+
+    Order routing (Phase 3.3):
+    - The intended entry order is submitted through the shared execution engine
+      (binance_service.place_order). While DRY_RUN=True (the default) this is a
+      pure simulation — the engine logs the order and NEVER contacts Binance.
+    - A paper position is only recorded when the engine confirms a SIMULATED
+      execution, so real-order pathways can never feed the paper book.
     """
     global PAPER_POSITIONS
 
     # Safety: paper trading and live trading are mutually exclusive.
     if binance_service.live_trading_enabled:
         print("open_paper_trade: blocked — live trading is enabled. Paper trades are disabled in live mode.")
+        return False
+
+    # Safety (Phase 3.3): paper flow is only permitted while DRY_RUN simulates orders.
+    # Enforcing this here (in addition to place_order's own check) makes it impossible
+    # to slowly leak real orders into the paper book.
+    if not binance_service.dry_run:
+        print("open_paper_trade: blocked — paper trades require DRY_RUN mode (safety).")
         return False
 
     symbol = analysis["symbol"]
@@ -292,6 +289,30 @@ def open_paper_trade(analysis):
         quantity = raw_quantity
         print(f"open_paper_trade: could not apply step-size for {symbol} ({qty_err}); using raw quantity.")
 
+    # ------------------------------------------------------------------
+    # ROUTE THE ENTRY ORDER THROUGH THE PHASE 3.2 EXECUTION ENGINE (Phase 3.3)
+    # ------------------------------------------------------------------
+    # While DRY_RUN=True (the default), place_order() only simulates and logs
+    # the order — it NEVER contacts Binance. All existing strategy/filter/
+    # stop/max checks above remain enforced before this call.
+    execution = binance_service.place_order(
+        symbol=symbol,
+        side=signal,
+        quantity=quantity,
+        price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+
+    # Defensive safety: only accept a DRY_RUN simulated execution. This
+    # guarantees no real-order pathway can feed into the paper book.
+    if execution.get("dry_run") is not True or execution.get("status") != "SIMULATED":
+        print(
+            f"open_paper_trade: engine did not confirm a DRY_RUN simulated execution "
+            f"for {symbol} (status={execution.get('status')}); refusing to open paper position."
+        )
+        return False
+
     PAPER_POSITIONS[symbol] = {
         "symbol": symbol,
         "side": signal,
@@ -303,11 +324,21 @@ def open_paper_trade(analysis):
         "position_size_usd": quantity * entry_price,
         "opened_at": str(pd.Timestamp.now()),
         "status": "OPEN",
+        "order_id": execution.get("order_id"),
+        "order_type": execution.get("order_type", "MARKET"),
+        "execution_status": execution.get("status"),
+        "execution_price": (
+            execution.get("execution_price")
+            if execution.get("execution_price") is not None
+            else entry_price
+        ),
     }
 
     print(
-        f"Paper trade opened: {symbol} {signal} | Entry: ${entry_price:,.2f} "
-        f"| Qty: {quantity:.6f} | Size: ${quantity * entry_price:,.2f}"
+        f"Paper trade opened (engine-routed): {symbol} {signal} "
+        f"| Entry: ${entry_price:,.2f} | Qty: {quantity:.6f} "
+        f"| Size: ${quantity * entry_price:,.2f} "
+        f"| Order ID: {execution.get('order_id')} | Status: {execution.get('status')}"
     )
     return True
 
@@ -385,7 +416,25 @@ def check_paper_positions():
                     closed = True
 
             if closed:
+                # ------------------------------------------------------------------
+                # ROUTE THE EXIT ORDER THROUGH THE EXECUTION ENGINE (Phase 3.3)
+                # ------------------------------------------------------------------
+                # A BUY position is closed with a SELL order (and vice versa). While
+                # DRY_RUN=True (the default) place_order() only simulates and logs —
+                # no real order is ever sent to Binance.
+                close_side = "SELL" if side == "BUY" else "BUY"
+                close_execution = binance_service.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=quantity,
+                    price=current_price,
+                )
+                close_order_id = close_execution.get("order_id")
+                close_status = close_execution.get("status")
+
                 position["pnl"] = pnl
+                position["close_order_id"] = close_order_id
+                position["close_execution_status"] = close_status
                 PAPER_BALANCE += pnl
                 PAPER_TRADE_HISTORY.append(position.copy())
                 if symbol in PAPER_POSITIONS:
@@ -393,7 +442,8 @@ def check_paper_positions():
                 print(
                     f"Paper trade closed for {symbol} ({side}): {position['status']} "
                     f"at ${current_price:,.2f} | Qty: {quantity:.6f} "
-                    f"| PnL: {pnl:+.4f} | New Balance: ${PAPER_BALANCE:,.2f}"
+                    f"| PnL: {pnl:+.4f} | New Balance: ${PAPER_BALANCE:,.2f} "
+                    f"| Close Order ID: {close_order_id} | Close Status: {close_status}"
                 )
 
         except Exception as e:
@@ -622,6 +672,8 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Qty: {qty:.6f} | Size: ${size:,.2f}\n"
                 f"SL: ${best_opportunity['stop_loss']:,.2f} | "
                 f"TP: ${best_opportunity['take_profit']:,.2f}\n"
+                f"Order ID: {pos.get('order_id', 'N/A')} | "
+                f"Status: {pos.get('execution_status', 'N/A')}\n"
             )
         else:
             message += "ℹ️ No new position opened (already open or HOLD signal).\n"
@@ -694,6 +746,22 @@ async def exchange(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧪 DRY_RUN Mode: {dry_run_status}\n\n"
     )
 
+    # API-permission verification (Phase 3.1, Requirement 5): confirm the
+    # configured key may trade under the read-only mandate (canTrade=True,
+    # withdrawal disabled). Read-only check; never enables trading or orders.
+    if binance_service.is_configured:
+        perm_res = binance_service.assert_api_permissions()
+        if perm_res.get("success"):
+            message += (
+                "🔐 API Permissions: OK (can trade, read-only mandate held).\n"
+            )
+        else:
+            message += (
+                f"🔐 API Permissions: BLOCKED — {perm_res.get('error')}\n"
+            )
+    else:
+        message += "🔐 API Permissions: Not checked (no API key configured).\n"
+
     if binance_service.is_configured:
         account_res = binance_service.get_account_balances(tracked_assets=list(COINS.keys()) + ["USDT"])
         if account_res.get("success"):
@@ -743,7 +811,8 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sym, pos in PAPER_POSITIONS.items():
             msg += (
                 f"• {sym} ({pos.get('side')}): Entry ${pos.get('entry', 0):,.2f} | "
-                f"SL: ${pos.get('stop_loss', 0):,.2f} | TP: ${pos.get('take_profit', 0):,.2f}\n"
+                f"SL: ${pos.get('stop_loss', 0):,.2f} | TP: ${pos.get('take_profit', 0):,.2f}"
+                f" | Order: {pos.get('order_id', 'N/A')}\n"
             )
 
     await update.message.reply_text(msg)
